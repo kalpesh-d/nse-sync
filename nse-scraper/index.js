@@ -1,10 +1,10 @@
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const { createClient } = require('@supabase/supabase-js');
-
-require('dotenv').config();
+require('dotenv').config(); // Ensure dotenv is loaded to access environment variables
 
 puppeteer.use(StealthPlugin()); // Enable the stealth plugin for anti-bot evasion
+
 
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseAnonKey = process.env.SUPABASE_ANON_KEY;
@@ -17,13 +17,9 @@ if (!supabaseUrl || !supabaseAnonKey) {
 const supabase = createClient(supabaseUrl, supabaseAnonKey);
 
 // --- Helper function to parse NSE date/time strings into ISO 8601 ---
-// Example NSE format: "18-Jun-2025 16:57:38"
-// This format is parsed into a Date object, then converted to an ISO 8601 string
-// (e.g., "2025-06-18T11:27:38.000Z") which PostgreSQL TIMESTAMP WITH TIME ZONE handles well.
 function parseNseDateTime(nseDateTimeStr) {
   if (!nseDateTimeStr) return null;
 
-  // Regex to extract day, month (short), year, hour, minute, second
   const parts = nseDateTimeStr.match(/(\d{2})-(\w{3})-(\d{4})\s(\d{2}):(\d{2}):(\d{2})/);
   if (!parts) {
     console.warn(`Warning: Could not parse date/time string: "${nseDateTimeStr}"`);
@@ -37,7 +33,6 @@ function parseNseDateTime(nseDateTimeStr) {
   };
   const month = monthMap[monthStr];
 
-  // Create a Date object. Note: Month is 0-indexed in JavaScript Date constructor.
   const date = new Date(year, month, day, hour, minute, second);
   return date.toISOString();
 }
@@ -47,14 +42,16 @@ async function fetchDataAndUpsertToSupabase() {
   let page;    // Declare page outside try for finally block access
 
   try {
+    console.log(`[${new Date().toISOString()}] Starting data fetch and upsert...`);
+
+    // --- Puppeteer Launch Configuration ---
     browser = await puppeteer.launch({
       headless: true,
       args: [
-        '--no-sandbox',             // Essential for Docker/server environments
-        '--disable-setuid-sandbox', // Recommended security sandbox disables
-        '--disable-features=IsolateOrigins,site-per-process', // Can help with some site isolation issues
-        '--lang=en-US,en',          // Mimic browser language settings
-        // '--disable-blink-features=AutomationControlled' is handled by stealth plugin
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-features=IsolateOrigins,site-per-process',
+        '--lang=en-US,en',
       ]
     });
     page = await browser.newPage();
@@ -62,7 +59,6 @@ async function fetchDataAndUpsertToSupabase() {
     const apiUrl = 'https://www.nseindia.com/api/corporate-announcements?index=equities';
     const warmUpUrl = 'https://www.nseindia.com/corporate-announcements';
 
-    // Set realistic browser-like headers to further mimic a real user
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
     await page.setExtraHTTPHeaders({
       'Accept': 'application/json, text/plain, */*',
@@ -72,23 +68,21 @@ async function fetchDataAndUpsertToSupabase() {
       'Sec-Fetch-Dest': 'empty',
       'Sec-Fetch-Mode': 'cors',
       'Sec-Fetch-Site': 'same-origin',
-      'Referer': warmUpUrl // Explicitly set Referer for API call if it doesn't automatically propagate
+      'Referer': warmUpUrl
     });
 
-    let apiResponseData = null; // Variable to hold the parsed JSON from the API
+    let apiResponseData = null;
 
-    console.log(`Step 1: Navigating to warm-up URL: ${warmUpUrl} to establish session...`);
-    await page.goto(warmUpUrl, { waitUntil: 'networkidle2' }); // Wait until no more than 2 network connections for at least 500ms
+    console.log('Step 1: Navigating to warm-up URL to establish session...');
+    await page.goto(warmUpUrl, { waitUntil: 'networkidle2' });
     console.log('Step 1 complete: Session likely established.');
 
-    console.log(`Step 2: Navigating to API URL: ${apiUrl} to fetch data...`);
+    // --- Step 2: Fetch Data from API URL using waitForResponse ---
+    console.log('Step 2: Navigating to API URL to fetch data...');
 
-    // 1. Wait for the specific API response (success or failure)
-    // 2. Navigate the page to the API URL
     const [apiResponse] = await Promise.all([
-      // Wait for a response where the URL matches our API and the status is OK (200)
-      page.waitForResponse(response => response.url() === apiUrl && response.ok(), { timeout: 30000 }), // 30s timeout
-      page.goto(apiUrl, { waitUntil: 'domcontentloaded' }) // 'domcontentloaded' is usually sufficient for API calls
+      page.waitForResponse(response => response.url() === apiUrl && response.ok(), { timeout: 30000 }),
+      page.goto(apiUrl, { waitUntil: 'domcontentloaded' })
     ]);
 
     if (apiResponse) {
@@ -97,14 +91,13 @@ async function fetchDataAndUpsertToSupabase() {
         console.log('JSON data captured successfully from API response!');
       } catch (error) {
         console.error('ERROR: Could not parse JSON from API response. It might not be valid JSON:', error);
-        apiResponseData = null; // Ensure apiResponseData is null if parsing fails
+        apiResponseData = null;
       }
     } else {
       console.error('ERROR: API response not captured or was not OK after navigation.');
       apiResponseData = null;
     }
 
-    // Only proceed if we have valid, parsed API data and it's an array
     if (apiResponseData && Array.isArray(apiResponseData)) {
       const corporateAnnouncements = apiResponseData;
       console.log(`Fetched ${corporateAnnouncements.length} announcements.`);
@@ -112,18 +105,14 @@ async function fetchDataAndUpsertToSupabase() {
       const tableName = 'equities_data';
 
       const formattedData = corporateAnnouncements.map(item => {
-        // Map API fields to your Supabase table columns (case-sensitive as per your DDL)
         const broadcastDateTime = parseNseDateTime(item.an_dt);
         const receiptDateTime = parseNseDateTime(item.an_dt);
         const disseminationDateTime = parseNseDateTime(item.exchdisstime);
 
-        // Handle DIFFERENCE: use provided field if valid, else calculate
         let differenceInterval = null;
         if (item.difference) {
-          // Check if it's already HH:MM:SS or just seconds (e.g., "00:00:01" or "1")
           differenceInterval = item.difference.includes(':') ? item.difference : `${item.difference} seconds`;
         } else if (receiptDateTime && disseminationDateTime) {
-          // Fallback calculation: (Dissemination - Receipt) in seconds
           const diffMs = new Date(disseminationDateTime).getTime() - new Date(receiptDateTime).getTime();
           const seconds = Math.floor(diffMs / 1000);
           differenceInterval = `${seconds} seconds`;
@@ -152,7 +141,7 @@ async function fetchDataAndUpsertToSupabase() {
         .from(tableName)
         .upsert(formattedData, {
           onConflict: conflictColumns.join(','),
-          ignoreDuplicates: true // Set to true if you only want to insert new, not update existing
+          ignoreDuplicates: false // Set to true if you only want to insert new, not update existing
         });
 
       if (upsertError) {
@@ -172,6 +161,7 @@ async function fetchDataAndUpsertToSupabase() {
   } catch (error) {
     console.error('An unexpected error occurred during the scraping process:', error);
   } finally {
+
     if (page) {
       try {
         await page.close();
@@ -188,7 +178,33 @@ async function fetchDataAndUpsertToSupabase() {
         console.error('Error closing browser:', err);
       }
     }
+    console.log(`[${new Date().toISOString()}] Data fetch and upsert finished.`);
   }
 }
 
-fetchDataAndUpsertToSupabase();
+let isProcessing = false; // Flag to prevent concurrent runs
+const INTERVAL_MINUTES = 15;
+const INTERVAL_MS = INTERVAL_MINUTES * 60 * 1000;
+
+async function runScheduledJob() {
+  if (isProcessing) {
+    console.log(`[${new Date().toISOString()}] Previous job still running. Skipping current scheduled run.`);
+    return;
+  }
+
+  isProcessing = true;
+  try {
+    await fetchDataAndUpsertToSupabase();
+  } catch (error) {
+    console.error(`[${new Date().toISOString()}] Error during scheduled job execution:`, error);
+  } finally {
+    isProcessing = false; // Reset flag whether successful or not
+  }
+}
+
+
+console.log(`[${new Date().toISOString()}] Initializing NSE scraper. Running first job now.`);
+runScheduledJob();
+
+console.log(`[${new Date().toISOString()}] Scheduling job to run every ${INTERVAL_MINUTES} minutes.`);
+setInterval(runScheduledJob, INTERVAL_MS);
