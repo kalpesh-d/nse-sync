@@ -1,26 +1,34 @@
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const { createClient } = require('@supabase/supabase-js');
+
 require('dotenv').config();
 
-puppeteer.use(StealthPlugin());
+puppeteer.use(StealthPlugin()); // Enable the stealth plugin for anti-bot evasion
 
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseAnonKey = process.env.SUPABASE_ANON_KEY;
 
 if (!supabaseUrl || !supabaseAnonKey) {
-  console.error('Error: Supabase URL or Anon Key not found in environment variables.');
-  process.exit(1);
+  console.error('FATAL ERROR: Supabase URL or Anon Key not found in environment variables. Please check your .env file.');
+  process.exit(1); // Exit process if critical environment variables are missing
 }
 
 const supabase = createClient(supabaseUrl, supabaseAnonKey);
 
-// Helper function to parse NSE date/time strings into ISO 8601 for TIMESTAMP WITH TIME ZONE
+// --- Helper function to parse NSE date/time strings into ISO 8601 ---
+// Example NSE format: "18-Jun-2025 16:57:38"
+// This format is parsed into a Date object, then converted to an ISO 8601 string
+// (e.g., "2025-06-18T11:27:38.000Z") which PostgreSQL TIMESTAMP WITH TIME ZONE handles well.
 function parseNseDateTime(nseDateTimeStr) {
   if (!nseDateTimeStr) return null;
-  // Example NSE format: "18-Jun-2025 16:57:38"
+
+  // Regex to extract day, month (short), year, hour, minute, second
   const parts = nseDateTimeStr.match(/(\d{2})-(\w{3})-(\d{4})\s(\d{2}):(\d{2}):(\d{2})/);
-  if (!parts) return null;
+  if (!parts) {
+    console.warn(`Warning: Could not parse date/time string: "${nseDateTimeStr}"`);
+    return null;
+  }
 
   const [_, day, monthStr, year, hour, minute, second] = parts;
   const monthMap = {
@@ -29,31 +37,32 @@ function parseNseDateTime(nseDateTimeStr) {
   };
   const month = monthMap[monthStr];
 
-  // Create a Date object in local time and convert to ISO string.
-  // Supabase TIMESTAMP WITH TIME ZONE is flexible, but ISO string is best practice.
-  // Note: JS Date constructor handles month (0-11) correctly
+  // Create a Date object. Note: Month is 0-indexed in JavaScript Date constructor.
   const date = new Date(year, month, day, hour, minute, second);
-  return date.toISOString(); // e.g., "2025-06-18T11:27:38.000Z" (adjusted for timezone)
+  return date.toISOString();
 }
 
 async function fetchDataAndUpsertToSupabase() {
-  let browser;
+  let browser; // Declare browser outside try for finally block access
+  let page;    // Declare page outside try for finally block access
+
   try {
     browser = await puppeteer.launch({
-      headless: true, // Keep true for backend deployment
+      headless: true,
       args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-features=IsolateOrigins,site-per-process',
-        '--lang=en-US,en',
-        '--disable-blink-features=AutomationControlled'
+        '--no-sandbox',             // Essential for Docker/server environments
+        '--disable-setuid-sandbox', // Recommended security sandbox disables
+        '--disable-features=IsolateOrigins,site-per-process', // Can help with some site isolation issues
+        '--lang=en-US,en',          // Mimic browser language settings
+        // '--disable-blink-features=AutomationControlled' is handled by stealth plugin
       ]
     });
-    const page = await browser.newPage();
+    page = await browser.newPage();
 
     const apiUrl = 'https://www.nseindia.com/api/corporate-announcements?index=equities';
     const warmUpUrl = 'https://www.nseindia.com/corporate-announcements';
 
+    // Set realistic browser-like headers to further mimic a real user
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
     await page.setExtraHTTPHeaders({
       'Accept': 'application/json, text/plain, */*',
@@ -63,114 +72,121 @@ async function fetchDataAndUpsertToSupabase() {
       'Sec-Fetch-Dest': 'empty',
       'Sec-Fetch-Mode': 'cors',
       'Sec-Fetch-Site': 'same-origin',
+      'Referer': warmUpUrl // Explicitly set Referer for API call if it doesn't automatically propagate
     });
 
-    let apiResponseData = null;
-
-    page.on('response', async (response) => {
-      if (response.url() === apiUrl) {
-        if (response.ok()) {
-          try {
-            apiResponseData = await response.json();
-            console.log('JSON data captured from API response!');
-            // Optional: Keep debugging line for full output if needed later
-            // console.log('--- Full API Response Data (for debugging) ---');
-            // console.log(JSON.stringify(apiResponseData, null, 2));
-            // console.log('-------------------------------------------');
-          } catch (error) {
-            console.error('Error parsing JSON from response:', error);
-          }
-        } else {
-          console.error(`Non-OK response status from API: ${response.status()} ${response.statusText}`);
-        }
-      }
-    });
+    let apiResponseData = null; // Variable to hold the parsed JSON from the API
 
     console.log(`Step 1: Navigating to warm-up URL: ${warmUpUrl} to establish session...`);
-    await page.goto(warmUpUrl, { waitUntil: 'networkidle2' });
+    await page.goto(warmUpUrl, { waitUntil: 'networkidle2' }); // Wait until no more than 2 network connections for at least 500ms
     console.log('Step 1 complete: Session likely established.');
 
     console.log(`Step 2: Navigating to API URL: ${apiUrl} to fetch data...`);
-    await page.goto(apiUrl, { waitUntil: 'domcontentloaded' });
 
-    await new Promise(resolve => setTimeout(resolve, 5000));
+    // 1. Wait for the specific API response (success or failure)
+    // 2. Navigate the page to the API URL
+    const [apiResponse] = await Promise.all([
+      // Wait for a response where the URL matches our API and the status is OK (200)
+      page.waitForResponse(response => response.url() === apiUrl && response.ok(), { timeout: 30000 }), // 30s timeout
+      page.goto(apiUrl, { waitUntil: 'domcontentloaded' }) // 'domcontentloaded' is usually sufficient for API calls
+    ]);
 
-    // --- CORRECTED LOGIC HERE ---
-    // The API response is directly an array, not an object with a 'data' key
+    if (apiResponse) {
+      try {
+        apiResponseData = await apiResponse.json();
+        console.log('JSON data captured successfully from API response!');
+      } catch (error) {
+        console.error('ERROR: Could not parse JSON from API response. It might not be valid JSON:', error);
+        apiResponseData = null; // Ensure apiResponseData is null if parsing fails
+      }
+    } else {
+      console.error('ERROR: API response not captured or was not OK after navigation.');
+      apiResponseData = null;
+    }
+
+    // Only proceed if we have valid, parsed API data and it's an array
     if (apiResponseData && Array.isArray(apiResponseData)) {
-      const corporateAnnouncements = apiResponseData; // Directly use apiResponseData as the array
+      const corporateAnnouncements = apiResponseData;
       console.log(`Fetched ${corporateAnnouncements.length} announcements.`);
 
       const tableName = 'equities_data';
 
       const formattedData = corporateAnnouncements.map(item => {
-        // Parse dates. NSE fields as observed in your output: an_dt, exchdisstime
-        const broadcastDateTime = parseNseDateTime(item.an_dt); // 'an_dt' looks like broadcast time
-        const receiptDateTime = parseNseDateTime(item.an_dt); // Assuming receipt is same as an_dt unless another field indicates it
-        const disseminationDateTime = parseNseDateTime(item.exchdisstime); // 'exchdisstime' looks like dissemination time
+        // Map API fields to your Supabase table columns (case-sensitive as per your DDL)
+        const broadcastDateTime = parseNseDateTime(item.an_dt);
+        const receiptDateTime = parseNseDateTime(item.an_dt);
+        const disseminationDateTime = parseNseDateTime(item.exchdisstime);
 
-        // Calculate difference for INTERVAL type
+        // Handle DIFFERENCE: use provided field if valid, else calculate
         let differenceInterval = null;
-        // If the 'difference' field is already a string like "00:00:00" or "00:00:01", use it directly.
-        // PostgreSQL INTERVAL can often parse "HH:MM:SS" or "X seconds".
         if (item.difference) {
+          // Check if it's already HH:MM:SS or just seconds (e.g., "00:00:01" or "1")
           differenceInterval = item.difference.includes(':') ? item.difference : `${item.difference} seconds`;
         } else if (receiptDateTime && disseminationDateTime) {
-          // Fallback to calculation if 'difference' field is not present or usable
-          const diffMs = new Date(disseminationDateTime).getTime() - new Date(receiptsDateTime).getTime();
+          // Fallback calculation: (Dissemination - Receipt) in seconds
+          const diffMs = new Date(disseminationDateTime).getTime() - new Date(receiptDateTime).getTime();
           const seconds = Math.floor(diffMs / 1000);
           differenceInterval = `${seconds} seconds`;
         }
 
         return {
-          // Mapping observed JSON fields to your Supabase table columns (case-sensitive)
           "SYMBOL": item.symbol,
-          "COMPANY NAME": item.sm_name || null, // 'sm_name' seems to be company name
-          "SUBJECT": item.desc, // 'desc' seems to be the subject
-          "DETAILS": item.attchmntText || null, // 'attchmntText' seems to be the details
+          "COMPANY NAME": item.sm_name || null,
+          "SUBJECT": item.desc,
+          "DETAILS": item.attchmntText || null,
           "BROADCAST DATE/TIME": broadcastDateTime,
-          "RECEIPT": receiptDateTime, // Using an_dt as receipt for now, adjust if you find a specific receipt time field
+          "RECEIPT": receiptDateTime,
           "DISSEMINATION": disseminationDateTime,
           "DIFFERENCE": differenceInterval,
-          "ATTACHMENT": item.attchmntFile || null, // 'attchmntFile' is the attachment link
-          "FILE SIZE": item.fileSize || null // 'fileSize' is the file size
+          "ATTACHMENT": item.attchmntFile || null,
+          "FILE SIZE": item.fileSize || null
         };
       });
 
-      // Define the columns that uniquely identify an announcement for onConflict.
-      // Based on the new data: SYMBOL, SUBJECT (desc), BROADCAST DATE/TIME (an_dt) seem suitable.
-      const conflictColumns = ['SYMBOL', 'SUBJECT', '"BROADCAST DATE/TIME"']; // Use quotes for columns with spaces
+      // **Crucially, ensure this matches a UNIQUE constraint you've added to your table.**
+      const conflictColumns = ['SYMBOL', 'SUBJECT', '"BROADCAST DATE/TIME"'];
       console.log(`Attempting to upsert ${formattedData.length} records into Supabase table '${tableName}' 
                         using unique columns: ${conflictColumns.join(', ')}...`);
 
-      const { data, error } = await supabase
+      const { error: upsertError } = await supabase
         .from(tableName)
         .upsert(formattedData, {
           onConflict: conflictColumns.join(','),
-          ignoreDuplicates: false
+          ignoreDuplicates: true // Set to true if you only want to insert new, not update existing
         });
 
-      if (error) {
-        console.error('Error upserting data to Supabase:', error);
-        if (error.details) console.error('Supabase error details:', error.details);
-        if (error.hint) console.error('Supabase error hint:', error.hint);
+      if (upsertError) {
+        console.error('ERROR: Failed to upsert data to Supabase:', upsertError);
+        if (upsertError.details) console.error('Supabase error details:', upsertError.details);
+        if (upsertError.hint) console.error('Supabase error hint:', upsertError.hint);
       } else {
-        console.log(`Successfully upserted data to Supabase.`);
+        console.log(`SUCCESS: Data successfully upserted to Supabase.`);
       }
     } else {
-      console.log('No valid announcement data (array) received from NSE API.');
+      console.log('Skipping Supabase upsert: No valid announcement data (expected array) received from NSE API.');
       if (apiResponseData) {
         console.log('Raw API Response Data Structure (for debugging):', Object.keys(apiResponseData));
-      } else {
-        console.log('apiResponseData was null or undefined.');
       }
     }
 
   } catch (error) {
-    console.error('An error occurred during the scraping or Supabase operation:', error);
+    console.error('An unexpected error occurred during the scraping process:', error);
   } finally {
+    if (page) {
+      try {
+        await page.close();
+        console.log('Puppeteer page closed.');
+      } catch (err) {
+        console.error('Error closing page:', err);
+      }
+    }
     if (browser) {
-      await browser.close();
+      try {
+        await browser.close();
+        console.log('Puppeteer browser closed.');
+      } catch (err) {
+        console.error('Error closing browser:', err);
+      }
     }
   }
 }
