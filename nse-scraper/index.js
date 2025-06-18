@@ -16,6 +16,53 @@ if (!supabaseUrl || !supabaseAnonKey) {
 
 const supabase = createClient(supabaseUrl, supabaseAnonKey);
 
+async function logDownloadActivity(status, message, recordsAdded = 0, logId = null) {
+  try {
+    if (logId) {
+      // Update existing log entry
+      const { error } = await supabase
+        .from('download_logs')
+        .update({
+          status: status,
+          message: message,
+          records_added: recordsAdded,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', logId);
+
+      if (error) {
+        console.error('Error updating download activity log:', error);
+      } else {
+        console.log(`[LOG] ${status.toUpperCase()}: ${message} (${recordsAdded} records)`);
+      }
+    } else {
+      // Create new log entry
+      const { data, error } = await supabase
+        .from('download_logs')
+        .insert([
+          {
+            status: status,
+            message: message,
+            records_added: recordsAdded,
+            created_at: new Date().toISOString()
+          }
+        ])
+        .select();
+
+      if (error) {
+        console.error('Error logging download activity:', error);
+        return null;
+      } else {
+        console.log(`[LOG] ${status.toUpperCase()}: ${message} (${recordsAdded} records)`);
+        return data[0].id; // Return the log ID for future updates
+      }
+    }
+  } catch (error) {
+    console.error('Failed to log download activity:', error);
+    return null;
+  }
+}
+
 // --- Helper function to parse NSE date/time strings into ISO 8601 ---
 function parseNseDateTime(nseDateTimeStr) {
   if (!nseDateTimeStr) return null;
@@ -40,9 +87,16 @@ function parseNseDateTime(nseDateTimeStr) {
 async function fetchDataAndUpsertToSupabase() {
   let browser; // Declare browser outside try for finally block access
   let page;    // Declare page outside try for finally block access
+  let totalRecordsProcessed = 0;
+  let operationMessage = '';
+  let logId = null; // Track the log entry ID
 
   try {
     console.log(`[${new Date().toISOString()}] Starting data fetch and upsert...`);
+
+    // Create initial log entry
+    logId = await logDownloadActivity('info', 'Starting NSE data download process...', 0);
+    console.log('[LOG] INFO: Starting NSE data download process (0 records)');
 
     // --- Puppeteer Launch Configuration ---
     browser = await puppeteer.launch({
@@ -91,16 +145,23 @@ async function fetchDataAndUpsertToSupabase() {
         console.log('JSON data captured successfully from API response!');
       } catch (error) {
         console.error('ERROR: Could not parse JSON from API response. It might not be valid JSON:', error);
+        operationMessage = 'Failed to parse JSON response from NSE API';
+        await logDownloadActivity('error', operationMessage, 0, logId);
         apiResponseData = null;
+        return;
       }
     } else {
       console.error('ERROR: API response not captured or was not OK after navigation.');
+      operationMessage = 'Failed to capture API response from NSE';
+      await logDownloadActivity('error', operationMessage, 0, logId);
       apiResponseData = null;
+      return;
     }
 
     if (apiResponseData && Array.isArray(apiResponseData)) {
       const corporateAnnouncements = apiResponseData;
       console.log(`Fetched ${corporateAnnouncements.length} announcements.`);
+      console.log(`[LOG] INFO: Successfully fetched ${corporateAnnouncements.length} announcements from NSE API (0 records)`);
 
       const tableName = 'equities_data';
 
@@ -123,7 +184,7 @@ async function fetchDataAndUpsertToSupabase() {
           "COMPANY NAME": item.sm_name || null,
           "SUBJECT": item.desc,
           "DETAILS": item.attchmntText || null,
-          "BROADCAST DATE/TIME": broadcastDateTime,
+          "BROADCAST_DATE_TIME": broadcastDateTime,
           "RECEIPT": receiptDateTime,
           "DISSEMINATION": disseminationDateTime,
           "DIFFERENCE": differenceInterval,
@@ -133,11 +194,11 @@ async function fetchDataAndUpsertToSupabase() {
       });
 
       // **Crucially, ensure this matches a UNIQUE constraint you've added to your table.**
-      const conflictColumns = ['SYMBOL', 'SUBJECT', '"BROADCAST DATE/TIME"'];
+      const conflictColumns = ['SYMBOL', 'SUBJECT', '"BROADCAST_DATE_TIME"'];
       console.log(`Attempting to upsert ${formattedData.length} records into Supabase table '${tableName}' 
                         using unique columns: ${conflictColumns.join(', ')}...`);
 
-      const { error: upsertError } = await supabase
+      const { data: upsertData, error: upsertError } = await supabase
         .from(tableName)
         .upsert(formattedData, {
           onConflict: conflictColumns.join(','),
@@ -148,18 +209,41 @@ async function fetchDataAndUpsertToSupabase() {
         console.error('ERROR: Failed to upsert data to Supabase:', upsertError);
         if (upsertError.details) console.error('Supabase error details:', upsertError.details);
         if (upsertError.hint) console.error('Supabase error hint:', upsertError.hint);
+
+        operationMessage = `Failed to upsert data to Supabase: ${upsertError.message}`;
+        await logDownloadActivity('error', operationMessage, 0, logId);
       } else {
         console.log(`SUCCESS: Data successfully upserted to Supabase.`);
+
+        // Calculate how many new records were actually added
+        let newRecordsCount = formattedData.length;
+        if (upsertData) {
+          // If upsertData is returned, we can calculate the difference
+          // For now, we'll use the total count as an approximation
+          newRecordsCount = formattedData.length;
+        }
+
+        totalRecordsProcessed = newRecordsCount;
+        operationMessage = `Successfully downloaded and processed ${formattedData.length} announcements`;
+
+        // Update the log entry with success status
+        await logDownloadActivity('success', operationMessage, totalRecordsProcessed, logId);
       }
     } else {
       console.log('Skipping Supabase upsert: No valid announcement data (expected array) received from NSE API.');
       if (apiResponseData) {
         console.log('Raw API Response Data Structure (for debugging):', Object.keys(apiResponseData));
       }
+
+      operationMessage = 'No valid announcement data received from NSE API';
+      await logDownloadActivity('warning', operationMessage, 0, logId);
     }
 
   } catch (error) {
     console.error('An unexpected error occurred during the scraping process:', error);
+
+    operationMessage = `Unexpected error during scraping: ${error.message}`;
+    await logDownloadActivity('error', operationMessage, 0, logId);
   } finally {
 
     if (page) {
@@ -189,6 +273,7 @@ const INTERVAL_MS = INTERVAL_MINUTES * 60 * 1000;
 async function runScheduledJob() {
   if (isProcessing) {
     console.log(`[${new Date().toISOString()}] Previous job still running. Skipping current scheduled run.`);
+    await logDownloadActivity('warning', 'Previous job still running, skipping scheduled run', 0);
     return;
   }
 
@@ -197,14 +282,37 @@ async function runScheduledJob() {
     await fetchDataAndUpsertToSupabase();
   } catch (error) {
     console.error(`[${new Date().toISOString()}] Error during scheduled job execution:`, error);
+    await logDownloadActivity('error', `Scheduled job execution failed: ${error.message}`, 0);
   } finally {
     isProcessing = false; // Reset flag whether successful or not
   }
 }
 
+// Initialize the download_logs table if it doesn't exist
+async function initializeLogsTable() {
+  try {
+    // Just check if the table exists by trying to select from it
+    const { error } = await supabase
+      .from('download_logs')
+      .select('id')
+      .limit(1);
 
-console.log(`[${new Date().toISOString()}] Initializing NSE scraper. Running first job now.`);
-runScheduledJob();
+    if (error) {
+      console.warn('Download logs table may not exist. Please run the setup SQL script.');
+      console.warn('Error details:', error.message);
+    } else {
+      console.log('Download logs table is ready for logging.');
+    }
+  } catch (error) {
+    console.warn('Could not check download logs table:', error.message);
+  }
+}
 
-console.log(`[${new Date().toISOString()}] Scheduling job to run every ${INTERVAL_MINUTES} minutes.`);
-setInterval(runScheduledJob, INTERVAL_MS);
+// Initialize logging system
+initializeLogsTable().then(() => {
+  console.log(`[${new Date().toISOString()}] Initializing NSE scraper. Running first job now.`);
+  runScheduledJob();
+
+  console.log(`[${new Date().toISOString()}] Scheduling job to run every ${INTERVAL_MINUTES} minutes.`);
+  setInterval(runScheduledJob, INTERVAL_MS);
+});

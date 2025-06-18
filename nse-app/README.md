@@ -1,14 +1,15 @@
 # NSE Corporate Announcements Dashboard
 
-A modern web dashboard for viewing NSE (National Stock Exchange) corporate announcements data from Supabase.
+A modern, optimized web dashboard for viewing NSE (National Stock Exchange) corporate announcements data from Supabase.
 
 ## Features
 
 - 📊 **Real-time Dashboard**: View total records and last update time
-- 🔄 **Data Refresh**: Refresh data from Supabase with one click
+- 🔄 **Live Data Updates**: Real-time updates from Supabase
 - 📋 **Data Table**: Browse recent corporate announcements with search and filtering
 - 🎨 **Modern UI**: Clean, responsive design with Tailwind CSS
 - 📱 **Responsive**: Works perfectly on desktop and mobile devices
+- 🧹 **Optimized Codebase**: DRY, modular, and easy to maintain
 
 ## Setup
 
@@ -39,9 +40,17 @@ Open [http://localhost:3000](http://localhost:3000) to view the dashboard.
 ## Usage
 
 1. **View Dashboard**: The main page shows statistics and recent data
-2. **Refresh Data**: Click "Refresh Data" to fetch latest data from Supabase
-3. **Browse Data**: View the latest 50 corporate announcements in the table
-4. **Monitor Updates**: See when data was last refreshed
+2. **Browse Data**: View the latest corporate announcements in the table
+3. **Monitor Updates**: See when data was last refreshed and view download logs
+
+## Code Structure & Optimization
+
+- **All logic is centralized in `dashboard.jsx`**: Handles state, tab switching, real-time updates, and data fetching.
+- **Helpers, constants, and data fetching** are modularized in `lib/helpers.js`, `lib/constants.js`, and `lib/data.js`.
+- **No unnecessary files**: All code is DRY, and unused files/components have been removed.
+- **UI components**: All UI logic is in the `components/` directory, with reusable subcomponents for cards, tables, and badges.
+- **Real-time**: Uses Supabase subscriptions for live updates.
+- **No dead code**: All code is used and maintained.
 
 ## Database Schema
 
@@ -57,7 +66,7 @@ The dashboard connects to a Supabase table named `equities_data` with the follow
 - `DIFFERENCE` - Time difference
 - `ATTACHMENT` - Attachment URL
 - `FILE SIZE` - File size
-- `created_at` - Record creation timestamp
+- `BROADCAST DATE/TIME` - Record creation timestamp
 
 ## Technologies Used
 
