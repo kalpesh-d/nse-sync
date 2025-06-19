@@ -29,8 +29,8 @@ export default function DownloadLogs({ downloadLogs, lastLogUpdate, getRealtimeI
           {getRealtimeIndicator()}
         </div>
       </CardHeader>
-      <CardContent>
-        <div className="space-y-4">
+      <CardContent className="overflow-auto">
+        <div className="space-y-4 max-h-96">
           {!downloadLogs.length ? (
             <div className="text-center py-8 text-muted-foreground">
               No download logs found.
